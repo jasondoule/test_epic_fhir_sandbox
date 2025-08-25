@@ -2,12 +2,17 @@
 import os, base64, hashlib, secrets, urllib.parse
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from fastapi import Request, Body, Path, Query
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 import httpx
 from dotenv import load_dotenv
+from fhir.resources.patient import Patient
+from fhir.resources.observation import Observation
+from fastapi.encoders import jsonable_encoder
+from typing import Optional, Dict, Any
 
 load_dotenv()
 
@@ -39,6 +44,7 @@ def html_logged_menu(logged: bool) -> str:
         return ""
     return (
       "<li><a href='/patient'>Patient Demographics</a></li>"
+      "<li><a href='/patient/resource'>Patient Demographics - Using fhir.resources.patient</a></li>"
       "<li><a href='/patient/labs'>Patient Labs - Search</a></li>"
       "<li><a href='/patient/vitals'>Patient Vitals - Search</a></li>"
     )
@@ -149,7 +155,52 @@ async def get_patient(request: Request, id: Optional[str] = None):
         return JSONResponse(r.json(), status_code=r.status_code)
     else:
         return HTMLResponse(r.text, status_code=r.status_code)
+
+@app.get("/patient/resource")
+async def get_patient_demographics(request: Request, patient_id: str = None):
+    access_token = request.session.get("access_token")
+    if not access_token: return JSONResponse({"error": "not_logged_in"}, status_code=401)
+
+    pid = patient_id or request.session.get("patient") 
+    if not pid: return JSONResponse({"error": "no_patient_id"}, status_code=400)
+
+    url = f"{FHIR_BASE}/Patient/{pid}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/fhir+json",  # 明确要 JSON
+    }
+    params = {"_format": "json"}             # 双保险
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers, params=params)
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": "network_error", "detail": str(e)}, status_code=502)
     
+    print("EPIC PATIENT RESPONSE From FHIR Resource:", r.json()) # print to console for demo purposes
+
+    if r.status_code != 200:
+        return JSONResponse({"error": "epic_error", "status": r.status_code, "detail": r.text}, status_code=r.status_code)
+
+    # 用 fhir.resources.patient.Patient 来解析
+    patient = Patient.model_validate(r.json())
+
+    #print("Parsed Patient:", patient)  # print to console for demo purposes
+
+    # 简单组装需要的人口学信息
+    demo = {
+        "id": patient.id,
+        "name": patient.name[0].text if patient.name else None,
+        "family": patient.name[0].family if patient.name else None,
+        "given": patient.name[0].given if patient.name and patient.name[0].given else None,
+        "gender": patient.gender,
+        "birthDate": patient.birthDate,
+    }
+
+    print("Patient Demographics:", demo)  # print to console for demo purposes
+
+    return JSONResponse(content=jsonable_encoder(demo))
+
 @app.get("/patient/labs") #search for list of lab results
 async def search_lab_observations(
     request: Request,
@@ -313,5 +364,138 @@ async def search_vitals(
 
     ct = r.headers.get("content-type", "").lower()
     return JSONResponse(r.json(), status_code=r.status_code) if "json" in ct else HTMLResponse(r.text, status_code=r.status_code)
+
+def _to_bare_id(x: str) -> str:
+    return x.rstrip("/").split("/")[-1]
+
+def _headers(token: Optional[str] = None, content_type: Optional[str] = None) -> Dict[str, str]:
+    h = {"Accept": "application/fhir+json"}
+    if token: h["Authorization"] = f"Bearer {token}"
+    if CLIENT_ID: h["Epic-Client-ID"] = CLIENT_ID
+    if content_type: h["Content-Type"] = content_type
+    return h
+
+def _build_lab_observation(
+    patient_id: str,
+    loinc_code: str,
+    value: float,
+    unit: str,
+    effective: Optional[str] = None,   # e.g. "2025-08-24T10:00:00Z" 或 "2025-08-24"
+    status: str = "final"
+) -> Dict[str, Any]:
+    """按最小字段组一个“实验室”Observation，并用 fhir.resources 校验。"""
+    body = {
+        "resourceType": "Observation",
+        "status": status,
+        "category": [{
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+            }],
+            "text": "Laboratory"
+        }],
+        "code": {
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": loinc_code
+            }]
+        },
+        "subject": {"reference": f"Patient/{_to_bare_id(patient_id)}"},
+        "valueQuantity": {"value": value, "unit": unit}
+    }
+    if effective:
+        # 你可以传 dateTime（含时间）或 date（仅日期）；这里直接当作 effectiveDateTime
+        body["effectiveDateTime"] = effective
+
+    # 用 fhir.resources 做强校验；再导出为纯 JSON
+    obs = Observation.model_validate(body)
+    return obs.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+# ---------------------------- CREATE (lab) --------------------------------------
+@app.post("/labs")
+async def create_lab_observation(
+    request: Request,
+    patient_id: str = Body(..., embed=True),
+    loinc: str = Body(..., embed=True, description="LOINC code, e.g. 4548-4"),
+    value: float = Body(..., embed=True),
+    unit: str = Body(..., embed=True),
+    effective: Optional[str] = Body(None, embed=True),
+    status: str = Body("final", embed=True),
+    raw: Optional[Dict[str, Any]] = Body(None, embed=True, description="可选：直接传完整 Observation 覆盖以上参数"),
+):
+    access_token = request.session.get("access_token")
+    # 允许你直接传完整 Observation；否则用上面的最小集构造
+    try:
+        payload = raw if (raw and raw.get("resourceType") == "Observation") \
+                 else _build_lab_observation(patient_id, loinc, value, unit, effective, status)
+    except Exception as e:
+        return JSONResponse({"error": "validation_error", "detail": str(e)}, status_code=422)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{FHIR_BASE}/Observation",
+                              headers=_headers(access_token, "application/fhir+json"),
+                              json=payload)
+    ct = r.headers.get("content-type", "").lower()
+    return JSONResponse(r.json() if "json" in ct else {"raw": r.text}, status_code=r.status_code)
+
+# ---------------------------- UPDATE (lab, PUT) ---------------------------------
+@app.put("/labs/{obs_id}")
+async def update_lab_observation(
+    request: Request,
+    obs_id: str = Path(...),
+    etag: Optional[str] = Query(None, description='可选并发控制：If-Match, 如 W/"3"'),
+    body: Dict[str, Any] = Body(..., description="完整 Observation JSON；会强制 resourceType/Id 一致"),
+):
+    token = request.session.get("access_token")
+    # 强制一致性
+    body = dict(body)
+    body["resourceType"] = "Observation"
+    body["id"] = obs_id
+    # 也强制 category 包含 laboratory（如果你希望硬约束）
+    if not any(
+        c.get("code") == "laboratory"
+        for cat in (body.get("category") or [])
+        for c in (cat.get("coding") or [])
+    ):
+        # 自动补上 laboratory 分类
+        body.setdefault("category", []).append({
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+            }],
+            "text": "Laboratory"
+        })
+
+    # 校验
+    try:
+        validated = Observation.model_validate(body).model_dump(mode="json", by_alias=True, exclude_none=True)
+    except Exception as e:
+        return JSONResponse({"error": "validation_error", "detail": str(e)}, status_code=422)
+
+    if not FHIR_BASE:
+        return JSONResponse({"validated": validated, "note": "No FHIR_BASE; not forwarded."})
+
+    headers = _headers(token, "application/fhir+json")
+    if etag:
+        headers["If-Match"] = etag
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.put(f"{FHIR_BASE}/Observation/{obs_id}", headers=headers, json=validated)
+    ct = r.headers.get("content-type", "").lower()
+    return JSONResponse(r.json() if "json" in ct else {"raw": r.text}, status_code=r.status_code)
+
+# ---------------------------- DELETE (lab) --------------------------------------
+@app.delete("/labs/{obs_id}")
+async def delete_lab_observation(request: Request, obs_id: str):
+    token = request.session.get("access_token")
+    if not FHIR_BASE:
+        return JSONResponse({"note": "No FHIR_BASE; simulated delete.", "id": obs_id})
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.delete(f"{FHIR_BASE}/Observation/{obs_id}", headers=_headers(token))
+    ct = r.headers.get("content-type", "").lower()
+    return JSONResponse(r.json() if "json" in ct else {"status": r.status_code, "raw": r.text},
+                        status_code=r.status_code)
 
 
